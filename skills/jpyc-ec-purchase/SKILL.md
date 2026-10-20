@@ -1,0 +1,881 @@
+---
+name: jpyc-ec-purchase
+description: Purchase products from JPYC EC Platform shops using JPYC stablecoin via x402 — one-shot HTTP-native gasless payments designed for AI agents.
+---
+
+# JPYC EC Purchase Skill
+
+AI エージェントが **JPYC EC Platform** (https://ec.jpyc-service.com) のショップ
+から商品を購入するためのスキルです。決済プロトコルは **x402 v2**
+([coinbase/x402](https://github.com/coinbase/x402) 仕様、2025-12 リリース) に
+準拠し、JPYC (日本円ステーブルコイン、1 JPYC = 1 JPY) を EIP-3009
+`transferWithAuthorization` 署名で支払います。
+
+**特徴**:
+
+- **ガス代不要**: エージェント側はゼロ。プラットフォームの facilitator が gas を支払う
+- **1 ショット決済**: HTTP 1 往復で settle が完了 (注文作成と署名提出を分けない)
+- **マルチチェーン**: Ethereum / Polygon / Avalanche / Kaia / Sepolia / Amoy /
+  Fuji / Kairos / Arc に対応
+- **AI 向け設計**: 認証なし、ウォレットアドレス + 署名 = identity
+
+---
+
+## Prerequisites
+
+- JPYC 残高のあるウォレットの**秘密鍵** (EIP-712 署名用)
+- `viem` または同等の EIP-712 署名ライブラリ
+
+---
+
+## Environments
+
+| 環境 | Base URL | 対応チェーン ID |
+|------|---------|-----------------|
+| Production | `https://ec.jpyc-service.com` | 1 (Ethereum), 137 (Polygon), 43114 (Avalanche), 8217 (Kaia) |
+| Staging | `https://stg-ec.jpyc-service.com` | 11155111 (Sepolia), 80002 (Amoy), 43113 (Fuji), 1001 (Kairos), 5042002 (Arc) |
+
+メインネット ID をステージングに、テストネット ID を本番に送ると、その環境では
+そのチェーンが使えないため弾かれます。`/api/v1/checkout` では `400 invalid_body`
+(`preferred_chain_id is not available in this environment`)、`/api/v1/balance/check`
+では `INVALID_CHAIN` が返ります。
+
+---
+
+## 決済方式の選択とAAウォレット
+
+`PAYMENT-REQUIRED.accepts` は複数の決済方式を含む場合があります。配列の順序を決済方式の判定に使わず、`extra.assetTransferMethod` で選択してください。
+
+本書の秘密鍵・EIP-712署名の例では `eip3009` を選択します。例中の `accepted` / `accepts` / `ACCEPTS_JSON` は、その選択済み要素を指します。対応要素が無ければ署名せず、対応ウォレットへ切り替えるよう案内してください。
+
+マイナウォレットなど、EIP-3009署名を作れないAAウォレットでは、ウォレット自身の署名・送金APIが使える場合に限り、次の手順で `erc20-transfer` を選択できます。EOAの秘密鍵だけを持つエージェントが、AAアドレスを自己申告して代行することはできません。
+
+1. 予約作成時に、支払元の `payer_address` と `transfer_authorization_version: "1"` を送ります。サーバーが `erc20-transfer` を提示したことを確認してください。
+2. 選んだ要素の `amount` / `asset` / `payTo` / `network` を確認します。表示合計 `summary.total_jpyc` を18桁のatomic unitsへ変換した値と `amount` が一致しなければ、署名・送金を開始しません。注文識別用の端数は足しません。
+3. `extra.payerAuthorization.message` を一文字も変更せず、支払元ウォレットで `personal_sign` します。この所有確認だけでは資金は動きません。
+4. `POST /api/v1/checkout/authorize-transfer` へ `{ "reservation_id": "res_...", "signature": "0x..." }` を送ります。サーバーはEOA / ERC-1271 / ERC-6492の署名を検証します。HTTP 200で成功するまで送金してはいけません。
+5. 予約ID・選択した要素・支払元を復旧用に保存してから、同じチェーンの `asset` コントラクトで `transfer(payTo, amount)` をウォレットから実行します。ガス代の負担はウォレットのスポンサー設定に依存します。
+6. `PAYMENT-SIGNATURE` には次のオブジェクトをbase64urlで符号化して指定し、通常と同じ `POST /api/v1/checkout` へbody `{ "reservation_id": "res_..." }` を送ります。
+
+```json
+{
+  "x402Version": 2,
+  "accepted": "選択したerc20-transfer要素を、payerAuthorizationを含めオブジェクトのままコピー",
+  "payload": { "payerAddress": "0x支払元", "txHash": "0x任意の送信結果" }
+}
+```
+
+上記 `accepted` の説明文字列は実際のリクエストではJSONオブジェクトに置換してください。`txHash` は任意のヒントです。ウォレットがUserOperation hashしか返さなくても、サーバーがJPYCのTransferログを調べます。送金前の所有確認を省略して、過去の送金を後付けで注文に充当することはできません。
+
+送金後の `transfer_not_found` は承認ブロック待ちの場合があります。同じ予約・payloadで結果確認だけを再試行し、transferを再送したり、新規予約で再購入したりしないでください。送金応答が失われた場合も同じ扱いです。予約が期限切れになった場合や確定状態が不明な場合は、注文履歴・運営の確認へ進みます。通常カート（`/checkout`）、対面レジ（`/pos`）、LINEトーク注文の `/pay` 画面は、同じAA決済基盤に対応しています。LINEの旧予約でAA方式が提示されない場合は注文を作り直します。所有確認後のLINE予約はネットワークを変更できません。定期便・JPYC Pay charges APIは対象外です。
+
+
+## 0円デモの署名体験（マイナウォレット対応）
+
+デモショップ（`is_demo: true`）の合計0 JPYC注文では、ウォレット自身の `personal_sign` を使って注文完了まで体験できます。通常の送金フローとは別の `demo-signature` 方式です。
+
+1. 予約リクエストに `payer_address` と `demo_signature_version: "1"` を送ります（MCPの `quote_checkout` でも同じ指定）。
+2. `accepts` に `extra.assetTransferMethod: "demo-signature"` があること、`amount` と表示合計がともに0であること、ネットワークと受取先を確認します。提示がないときはこの方式を合成しないでください。
+3. 選択した `extra.payerAuthorization.message` を変更せず、対象ウォレットで `personal_sign` します。EOA / ERC-1271 / ERC-6492を検証できます。
+4. 通常と同じ `POST /api/v1/checkout` へ `{ "reservation_id": "res_..." }` を送り、`PAYMENT-SIGNATURE` ヘッダに以下のPaymentPayloadをbase64urlで渡します（MCPは `submit_payment`）。
+
+```json
+{
+  "x402Version": 2,
+  "accepted": "提示されたdemo-signature要素をオブジェクトのままコピー",
+  "payload": { "payerAddress": "0x対象ウォレット", "demoSignature": "0xpersonal_signの署名" }
+}
+```
+
+`accepted` の説明文字列は実際のJSONオブジェクトへ置き換えてください。`demoSignature` は偶数桁hex、最大16KiBです。
+
+この方式で `authorize-transfer`、`transfer`、`approve`、facilitatorは呼びません。JPYC残高・ガス代は不要です。成功時は `data.is_demo: true`、`tx_hash` はデモ用識別子です。通常店舗・有料注文には使えず、署名は予約・店舗・チェーン・ウォレット・有効期限に結びつきます。確認結果が受け取れなければ同じ予約と署名で再送してください。旧予約にdemo-signatureがない場合は、新しい予約を作成します。
+
+エラー: `demo_signature_unavailable` (400: 対象外)、`demo_signature_invalid` (402: 不正署名)、`demo_signature_verification_unavailable` (502: 検証RPC障害)、`reservation_expired` (400: 期限切れ)、`demo_checkout_failed` (502: 保存失敗)。いずれもこの方式から送金は発生しません。
+
+
+---
+
+## Purchase Flow (x402)
+
+注文は **`POST /api/v1/checkout`** に一本化されています。人間ユーザーの
+storefront も AI エージェントも同じエンドポイントを使います。エージェントは
+以下の 3 ステップで完走します。
+
+```
+1. GET  /api/v1/products/{productId}   ← 各商品の配送/バリエーション要件確認
+2. POST /api/v1/checkout (no PAYMENT-SIGNATURE)
+                                       ← 402 challenge + reservation_id + 金額サマリ
+3. POST /api/v1/checkout (with PAYMENT-SIGNATURE, body は reservation_id のみ)
+                                       ← 200 + 注文成立 + tx_hash
+```
+
+`/api/v1/checkout` は **カート単位** (複数商品 OK)。1 商品だけ買う場合も
+`items` 配列に 1 件入れるだけです。
+
+### Step 1 — Product info & branching
+
+商品の **必須条件** を取得します。これを必ず先に呼んでください。スキップすると
+ステップ 2 で `400 shipping_required` / `400 invalid_variant` が返り、エージェント
+は再度ユーザーに情報を聞き直す必要があります。
+
+```http
+GET https://ec.jpyc-service.com/api/v1/products/{productId}
+```
+
+レスポンス:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "product": {
+      "id": "uuid",
+      "slug": "matcha-latte",
+      "name": "商品名",
+      "description": "...",
+      "price_jpyc": "1500.000000000000000000",
+      "stock": 42,
+      "image_urls": ["https://..."],
+      "category": "飲料",
+      "subcategory": "お茶",
+      "tags": ["organic", "limited"],
+      "requires_shipping": true,
+      "grants_free_shipping": false,
+      "variants": {
+        "options": [{ "name": "サイズ", "values": ["S", "M", "L"] }],
+        "skus": [{ "options": { "サイズ": "M" }, "price_jpyc": "1500.0" }]
+      },
+      "review_avg_rating": 4.7,
+      "review_count": 12,
+      "has_nft_discount": false
+    },
+    "shop": {
+      "id": "uuid",
+      "slug": "example-shop",
+      "name": "ショップ名",
+      "wallet_address": "0x...",
+      "available_chains": [137, 43114],
+      "default_chain_id": 137,
+      "is_demo": false,
+      "x402_enabled": true,
+      "checkout_options": [
+        {
+          "id": "noshi",
+          "name": "のし",
+          "required": true,
+          "type": "select",
+          "values": [
+            { "label": "あり", "surcharge_jpyc": "100" },
+            { "label": "なし", "surcharge_jpyc": "0" }
+          ]
+        },
+        {
+          "id": "message",
+          "name": "メッセージカード",
+          "required": false,
+          "type": "text",
+          "max_length": 100
+        }
+      ]
+    }
+  }
+}
+```
+
+**判定** — Step 2 に進む前に、商品とショップの **必須条件をすべて満たす情報を
+集めてあるか** を必ずこの表で確認してください。`checkout_options` は商品ではなく
+**ショップ単位** の設定です。
+
+| フィールド | 条件 | エージェントの行動 |
+|-----------|------|-------------------|
+| `product.requires_shipping === true` | 配送先住所が**必須** | ユーザーに **氏名・郵便番号・都道府県・市区町村以降の住所・電話番号** を聞き、`shipping` ブロックに入れる (email は別途必須) |
+| `product.variants !== null` | バリエーション選択が**必須** | ユーザーに **どの組み合わせ** を選ぶか聞き、`items[].variant_selections` に入れる (例: `{ "サイズ": "M", "色": "白" }`) |
+| `shop.checkout_options[]` の各要素で `required === true` | **そのオプションの値が必須** | ユーザーに値を聞き、`checkout_options` に `{ option_id: 値 }` で入れる。`required:false` のものは省略可。詳細は下の「checkout_options」節 |
+| `shop.x402_enabled === false` | このショップは **x402 購入不可** | 購入を中止し、ユーザーに「このショップは AI エージェント経由の購入に対応していません」と伝える。`POST /checkout` しても `400 x402_disabled` で弾かれる |
+| `shop.available_chains` | このチェーン以外は払えない | ユーザーに preference があれば pass、なければサーバが先頭を使う |
+| `shop.is_demo === true` | **デモショップ** | JPYC 残高ゼロでも完走できる。実際の送金は起きず `tx_hash` はダミー。x402 フローの動作確認に使える (後述) |
+
+#### checkout_options (ショップ定義の購入オプション)
+
+`shop.checkout_options` は、のし・到着時間指定・メッセージカードなど **ショップが
+独自に定義した購入時オプション** の配列です。各要素の構造:
+
+- `id` — オプション識別子。`POST /checkout` の `checkout_options` ではこの `id`
+  をキーに値を渡す
+- `name` — ユーザー向け表示名 (例: 「のし」)
+- `required` — **`true` ならそのオプションの値は必須**。値を送らずに `POST
+  /checkout` すると `400 invalid_checkout_option` になる。`false` は省略可
+- `type` — `"select"`（`values` から 1 つ選ぶ）/ `"text"`（自由入力、`max_length`
+  まで）/ `"checkbox"`（true/false）
+- `values` (select のみ) — 選択肢。各 `label` と追加料金 `surcharge_jpyc`
+- `surcharge_jpyc` — 選んだ値に応じて合計金額に加算される (Step 2 の 402 で
+  確定するので、エージェント側で足し算する必要はない)
+
+`POST /checkout` に渡す形式 (Step 2 参照):
+
+```json
+"checkout_options": { "noshi": "あり", "message": "お誕生日おめでとう" }
+```
+
+`required:true` のオプションが 1 つでもあるショップでは、`checkout_options` を
+省略すると Step 2 で弾かれます。**ショップに `checkout_options` がある場合は、
+`required` を確認して必須のものを必ずユーザーに尋ねてください。**
+
+> **デモショップ (`shop.is_demo === true`) について**: x402 購入フロー
+> (402 → 署名 → 注文確定) を JPYC を持たずに体験するためのショップです。
+> リクエスト/レスポンスの形・署名手順は通常ショップと完全に同一ですが、
+> settle で **on-chain 送金が行われません** (facilitator を経由しない)。
+> - JPYC 残高ゼロのウォレットでも settle が成功する
+> - `tx_hash` は `0xde30…` で始まるダミー値 (注文ごとにユニーク)。ブロック
+>   エクスプローラでは引けないので、エクスプローラ URL を提示しないこと。
+>   デモ判定は `data.is_demo === true` で行うこと (tx_hash の中身に依存しない)
+> - settle 成功レスポンスの `data.is_demo` が `true` で返る
+> - 署名 (EIP-712) の検証はサーバ側で行われるため、不正な署名は弾かれる
+
+> **ヒント**: `image_urls` は **空配列もありえる**。サムネ表示で `image_urls[0]`
+> を使う場合は必ず存在チェックすること。
+
+エラー:
+
+- `404 PRODUCT_NOT_FOUND` — 商品が存在しないか非公開
+- `500 INTERNAL_ERROR` — サーバエラー
+
+### Step 2 — Request 402 challenge
+
+`PAYMENT-SIGNATURE` ヘッダ **なし** で POST。サーバは在庫を確認して約5分間有効な予約を作成し、
+402 + `PAYMENT-REQUIRED` ヘッダ + 金額サマリを返します。
+
+```http
+POST https://ec.jpyc-service.com/api/v1/checkout
+Content-Type: application/json
+
+{
+  "shop_id": "uuid-of-shop",
+  "preferred_chain_id": 137,
+  "items": [
+    { "product_id": "uuid-1", "quantity": 1, "variant_selections": { "サイズ": "M" } },
+    { "product_id": "uuid-2", "quantity": 2 }
+  ],
+  "customer_email": "yamada@example.com",
+  "shipping": {
+    "name": "山田太郎",
+    "zip": "150-0001",
+    "prefecture": "東京都",
+    "address1": "渋谷区神宮前1-2-3",
+    "address2": "サンプルマンション101",
+    "tel": "090-1234-5678"
+  },
+  "is_gift": false,
+  "customer_note": "プレゼント用に包装してください"
+}
+```
+
+**フィールド**:
+
+| フィールド | 必須 | 説明 |
+|-----------|------|------|
+| `shop_id` | ✅ | 全 `items` が同一ショップに属している必要がある |
+| `items[]` | ✅ | `product_id` + `quantity` (+ `variant_selections`)。最低 1 件 |
+| `items[].variant_selections` | `variants !== null` の商品で必須 | `{ option_name: value }` |
+| `customer_email` | ✅ | 注文確認メールの宛先。x402 経路でも必須 |
+| `preferred_chain_id` | 任意 | 全 `items` の `available_chains` の積集合のいずれか |
+| `shipping` | いずれかの item が `requires_shipping` のとき必須 | name / zip / prefecture / address1 / tel |
+| `is_gift` / `gift_recipient` | 任意 | 贈り物のとき `is_gift: true` + `gift_recipient` |
+| `checkout_options` | 任意 | ショップ定義のオプション (のし等) の選択値 |
+| `customer_note` | 任意 | ショップへの伝言 (max 2000 文字) |
+| `payer_address` | 通常は任意 (推奨)、AA・NFT割引・クーポンでは必須 | 署名するウォレットアドレス。指定すると settle 時に署名の `from` と照合され、別ウォレットの署名は 400 `payer_mismatch` になる (2026-07 追加) |
+| `pos_session_id` | 使用しない | 運営の対面レジ UI 専用の内部フィールド (`ps_<16hex>`、レジ画面の決済完了検知用)。外部クライアント / エージェントは送らないこと (2026-08 追加) |
+
+レスポンス (HTTP 402):
+
+```http
+HTTP/1.1 402 Payment Required
+PAYMENT-REQUIRED: eyJ4NDAyVmVyc2lvbiI6Mi...   (base64url JSON of PaymentRequired)
+Content-Type: application/json
+
+{
+  "ok": false,
+  "error": { "code": "payment_required", "message": "PAYMENT-SIGNATURE header is required" },
+  "data": {
+    "reservation_id": "res_a1b2c3d4...",
+    "expires_at_unix_ms": 1731486100000,
+    "summary": {
+      "subtotal_jpyc": "5000",
+      "discount_jpyc": "0",
+      "shipping_jpyc": "500",
+      "checkout_options_surcharge_jpyc": "0",
+      "total_jpyc": "5500"
+    }
+  }
+}
+```
+
+`summary` を使って、署名前にユーザーへ正しい合計金額を提示してください。
+
+> **注意**: `summary` の各値は文字列で、小数桁数は項目により不揃いです
+> (`total_jpyc` は `"3500"`、`shipping_jpyc` は `"500.000000000000000000"` の
+> ように 18 桁付きで返ることがある)。表示前に `parseFloat` / `Number` で正規化
+> してください。実際に署名する金額は `summary` ではなく
+> `accepted.amount` (atomic units) を使うこと。
+
+`PAYMENT-REQUIRED` ヘッダを base64url デコードすると以下の x402 v2 `PaymentRequired`
+構造体になります:
+
+```json
+{
+  "x402Version": 2,
+  "error": "PAYMENT-SIGNATURE header is required",
+  "resource": {
+    "url": "https://ec.jpyc-service.com/api/v1/checkout",
+    "description": "商品名 × 1",
+    "mimeType": "application/json"
+  },
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:137",
+      "amount": "1500000000000000000000",
+      "asset": "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29",
+      "payTo": "0xShopWallet...",
+      "maxTimeoutSeconds": 90,
+      "extra": {
+        "assetTransferMethod": "eip3009",
+        "name": "JPY Coin",
+        "version": "1",
+        "decimals": 18,
+        "symbol": "JPYC"
+      }
+    }
+  ],
+  "extensions": {
+    "x402.jpyc-ec.reservation_id": "res_a1b2c3d4..."
+  }
+}
+```
+
+> **重要 (デコード方法)**: ヘッダは `base64url` (RFC 4648 §5、`-` `_` を使う変種)
+> でエンコードされています。Node なら `Buffer.from(header, "base64url")` で
+> デコード可。**シェルの `base64 -d` は環境差** (macOS の BSD 版は base64url を
+> サポートせず壊れます) があるので、シェル経由でデコードしたい場合は
+> `tr '_-' '/+'` してパディングを補ってから `base64 -d` するか、Node/Python の
+> `base64.urlsafe_b64decode` を使ってください。`SKILL-acli.md` に詳細あり。
+
+**ユーザーに見せて確認** すべき情報:
+
+- 合計金額: `amount` を 10^18 で割って JPYC 表示 (例: `1500000000000000000000` → 1500 JPYC)
+- 支払先: `payTo` (ショップのウォレット)
+- チェーン: `network` (CAIP-2)
+
+エラー:
+
+- `400 invalid_body` — リクエストボディが zod schema に合わない。**`quantity <= 0`、
+  `customer_email` 欠落/不正、`preferred_chain_id` がその環境で使えない、等は
+  すべてこの `invalid_body` で返る** (専用コードはない)。`message` に zod の
+  詳細 (`path` 付き) が JSON 文字列で入るので、どのフィールドが原因かはそれを見る
+- `400 shipping_required` — `requires_shipping=true` なのに `shipping` 欠落 → ユーザーに住所聞く
+- `400 variant_required` / `400 invalid_variant` — variants 必須なのに `variant_selections` 欠落/不正
+- `400 invalid_checkout_option` — `required:true` の checkout_options を送っていない、
+  または値が定義 (select の選択肢 / text の max_length 等) に合わない → ショップの
+  `checkout_options` を見て必須オプションをユーザーに聞き、再送する。
+  `message` は「到着時間を選択してください」のような **ユーザー向けの日本語**
+  で、オプションの `name` (表示名、`id` ではない) を含む。そのままユーザーに
+  見せてよいが、どの定義が原因かをコードで特定したいときは `message` の文字列
+  一致ではなく `checkout_options` の `name` と突き合わせること
+- `400 shop_mismatch` — `items` に別ショップの商品が混在
+- `400 no_common_chain` — `items` の `available_chains` に共通チェーンがない
+- `400 x402_disabled` — ショップが x402 をオプトアウト → このショップは購入不可
+- `404 product_not_found`
+- `404 shop_not_found`
+- `409 insufficient_stock` — 在庫不足
+- `429 rate_limited` — 30 req/60s/IP の上限
+
+### Step 3 — Sign and settle
+
+#### 3a. EIP-712 署名
+
+JPYC の `transferWithAuthorization` を EIP-712 で署名します。
+
+**Domain**:
+
+```typescript
+{
+  name: "JPY Coin",                // 固定。accepted.extra.name と一致
+  version: "1",                    // 固定。accepted.extra.version と一致
+  chainId: 137,                    // accepted.network の eip155: 部分
+  verifyingContract: "0xE7C3D8C9a439feDe00D2600032D5dB0Be71C3c29"  // accepted.asset
+}
+```
+
+**Types**:
+
+```typescript
+{
+  TransferWithAuthorization: [
+    { name: "from",        type: "address" },
+    { name: "to",          type: "address" },
+    { name: "value",       type: "uint256" },
+    { name: "validAfter",  type: "uint256" },
+    { name: "validBefore", type: "uint256" },
+    { name: "nonce",       type: "bytes32" }
+  ]
+}
+```
+
+**Message**:
+
+```typescript
+{
+  from: <agent wallet address>,                    // 署名者
+  to: <accepted.payTo>,                          // ショップ wallet
+  value: BigInt(<accepted.amount>),              // atomic units
+  validAfter: 0n,                                  // 即座に有効
+  validBefore: BigInt(Math.floor(Date.now() / 1000) + 90),  // now + 90s
+  nonce: <32-byte random hex>                      // 0x + 64 hex
+}
+```
+
+`primaryType` は `"TransferWithAuthorization"` (※ 既存の `ReceiveWithAuthorization`
+ではない。x402 では facilitator が msg.sender になるため `Transfer` 系を使う)。
+
+#### 3b. PaymentPayload 構築
+
+x402 v2 の `PaymentPayload` を組み立てます:
+
+```json
+{
+  "x402Version": 2,
+  "accepted": <accepted を verbatim でコピー>,
+  "payload": {
+    "signature": "0x<130-char hex>",  // 上の署名 (r + s + v)
+    "authorization": {
+      "from": "0x<agent wallet>",
+      "to": "0x<accepted.payTo>",
+      "value": "<accepted.amount>",
+      "validAfter": "0",
+      "validBefore": "<unix sec>",
+      "nonce": "0x<32 bytes hex>"
+    }
+  }
+}
+```
+
+これを **base64url エンコード** して `PAYMENT-SIGNATURE` ヘッダに乗せます。
+
+#### 3c. Settle リクエスト
+
+```http
+POST https://ec.jpyc-service.com/api/v1/checkout
+Content-Type: application/json
+PAYMENT-SIGNATURE: eyJ4NDAyVmVyc2lvbiI6Mi...   (base64url JSON)
+
+{
+  "reservation_id": "res_a1b2c3d4..."
+}
+```
+
+> 2 回目の body は `reservation_id` だけです。`items` 等は再送しません
+> (1 回目で reservation snapshot に固定済み)。任意で `line_id_token`
+> (LIFF の ID トークン、LINE Mini App 決済専用) を渡せますが、外部
+> エージェントには関係ありません — 省略してください (2026-07 追加)。
+
+**成功レスポンス** (HTTP 200):
+
+```http
+HTTP/1.1 200 OK
+PAYMENT-RESPONSE: eyJzdWNjZXNzIjp0cnVlLC...   (base64url JSON of SettlementResponse)
+Content-Type: application/json
+
+{
+  "ok": true,
+  "data": {
+    "order_id": "uuid",
+    "order_number": "ORD-20260514-GOSFBI",
+    "tx_hash": "0x<64 hex>",
+    "network": "eip155:137",
+    "payer": "0x<agent wallet>",
+    "amount_atomic": "1500000000000000000000",
+    "is_demo": false
+  }
+}
+```
+
+注文は `order_status=3` (collected = 決済完了) で確定済み。on-chain transfer も完了
+しているので追加の署名や確認は不要です。`tx_hash` は対応するブロックエクスプローラ
+(Polygonscan / Etherscan / Snowtrace 等) でそのまま検索できます。
+
+> **`data.is_demo`**: `true` ならデモショップの注文です。on-chain 送金は
+> 行われておらず、`tx_hash` は `0xde30…` で始まるダミー値 (注文ごとにユニーク) で
+> エクスプローラでは引けません。`is_demo: true` のときはユーザーに「これは
+> デモ決済で、実際の JPYC 送金は行われていません」と明示してください。
+
+エラー (status / code):
+
+| Status | Code | 意味 | エージェントの行動 |
+|--------|------|------|-------------------|
+| 400 | `invalid_payment_payload` | base64 や JSON が壊れている | 再構築 |
+| 400 | `payload_mismatch` | 署名内容が reservation と不一致 | step 2 からやり直し |
+| 400 | `payer_mismatch` | 1 回目の `payer_address` と署名の `from` が不一致 (2026-07 追加) | 同じ reservation のまま正しいウォレットで再署名して再送 |
+| 402 | `invalid_exact_evm_payload_signature` | 署名が不正 / 期限切れ | 再署名 |
+| 402 | `invalid_exact_evm_payload_authorization_valid_before` | 90s 超過 | step 2 からやり直し (新しい reservation を取得) |
+| 402 | `insufficient_funds` | JPYC 残高不足 | ユーザーに「残高不足です」と通知 |
+| 404 | `reservation_not_found` | reservation 5 分超過 (※決済済み reservation への再送では返らない — 下記「冪等リプレイ」参照) | step 2 からやり直し |
+| 404 | `product_disappeared` | 商品が削除された | 別の商品提案 |
+| 409 | `insufficient_stock` | 在庫切れ | 別の商品提案 |
+| 409 | `shop_wallet_changed` | ショップがウォレット変更 | step 2 からやり直し |
+| 429 | `rate_limited` | 決済・確認は900 req/60s/IP、かつ40 req/60s/予約ID (予約作成の30 req/60s/IPとは別枠) | 15秒以上待ち、同じ予約・支払い情報でリトライ |
+| 502 | `facilitator_insufficient_native_balance` | facilitator (relayer) の gas 切れ | リトライ (運営に自動通知される。復旧まで数分かかることがある) |
+| 502 | `settlement_failed` | facilitator が settle 失敗 (上記以外) | リトライ。繰り返すなら運営に問い合わせ |
+| 502 | `unexpected_settle_error` | facilitator が分類不能な例外を捕捉 | リトライ。繰り返すなら運営に問い合わせ |
+| 502 | `facilitator_unreachable` | 決済サービスに接続不可 (資金は動いていない) | リトライ |
+| 502 | `settle_precondition_failed` | settle 前の記録に失敗 (資金は動いていない) | リトライ |
+| 502 | `authorization_already_used` | **この nonce は既にオンチェーンで消費済み = 支払いは成立している** | `settlement_state_unknown` と同じ扱い: 再署名せず `GET /orders` で注文を確認 (自動復旧される) |
+| 409 / 502 | `settlement_state_unknown` | **決済結果が不明 (資金が動いている可能性あり)** | **再署名・再送金・再購入しない**。2〜3 分待って `GET /orders?customer_address=...` を確認。注文があれば決済成功 (自動復旧)。無い場合も支払い未成立とは断定せず、同じ予約の状態照会または運営確認を続ける |
+
+> **冪等リプレイ (2026-07 追加)**: 同じ `reservation_id` + `PAYMENT-SIGNATURE` で
+> settle を再送した場合、既に決済済みなら同じ注文情報が 200 で返る。
+> トランスポートエラー (接続断・タイムアウト) 後のリトライは安全。
+> `settlement_state_unknown` を受けた場合のみ、上記の手順で状態確認を挟むこと。
+
+> **送金確認の間隔 (2026-09)**: `erc20-transfer` の `transfer_not_found` (402) は同じ予約・支払い情報のまま、前の応答を待ち、確認開始を通常2秒以上空けて再試行する。長時間未確定・接続エラーは5秒以上、429は15秒以上待つ。Polygonは`finalized`、Kaia mainnetはBFTの即時確定を使い、どちらも送金ログ・receipt・正規ブロックを照合してから確定する。RPCの不整合は502 `transfer_verification_failed` として再確認する。送金をやり直さず復旧情報を保持する。EIP-3009のFacilitator確定条件は変更なし。方式別の送金前所有確認・payloadは [OpenAPI](https://ec.jpyc-service.com/api/v1/openapi.yaml) を参照。
+
+---
+
+## Other Useful Endpoints
+
+### Shop / product discovery
+
+| Endpoint | 用途 |
+|---------|------|
+| `GET /api/v1/shops` | 全ショップ一覧 |
+| `GET /api/v1/shops/{slug}/products` | ショップ内の商品一覧 |
+| `GET /api/v1/shops/{slug}/nft-discounts` | NFT 割引ルール (購入時に該当 NFT 所持で割引) |
+| `GET /api/v1/products/{id}` | 商品詳細 (step 1) |
+| `GET /api/v1/products/{id}/reviews` | 商品レビュー一覧 |
+| `GET /api/v1/categories` | カテゴリ・タグの一覧 |
+
+> **`product.slug` について**: 商品レスポンスの `slug` は人間可読な商品URL用の
+> 値です (商品ページURL = `/shops/{shop.slug}/products/{slug ?? id}`、`null` の
+> 場合は `id` を使う)。**チェックアウトの `items[].product_id` には必ず商品の
+> `id` (UUID) を使ってください** — `slug` は URL 表示専用で、API リクエストの
+> 識別子としては使いません。
+
+### Agent discovery surface
+
+REST API を直接叩く以外に、プラットフォームはエージェント向けの発見・
+対話レイヤーを公開している。
+
+| Endpoint | 用途 |
+|---------|------|
+| `GET /.well-known/commerce-manifest` | プラットフォームの能力・エンドポイント・x402 決済レール一覧 (Open Agentic Commerce 形式) |
+| `GET /.well-known/agent-card.json` | A2A Agent Card |
+| `GET /api/v1/openapi.yaml` | OpenAPI 3.1 仕様 |
+| `GET /llms.txt` | LLM 向け Markdown インデックス |
+| `POST /mcp` | MCP サーバー (Streamable HTTP)。商品検索・購入ツールを提供 |
+
+MCP ホスト (Claude Desktop / Cursor 等) からは `POST /mcp` に接続すると、
+`search_products` / `get_product` / `quote_checkout` / `submit_payment`
+などのツールが使える。本スキルの REST 手順は、MCP を使わず HTTP を直接
+叩くエージェント向け。
+
+### Order tracking
+
+```http
+GET https://ec.jpyc-service.com/api/v1/orders?customer_address=0x...
+```
+
+レスポンス: `orders[]` (注文履歴、x402 経由も既存経路の注文も両方返る)。
+
+`order_status` の意味:
+
+- `3` — **決済完了** (`/api/v1/checkout` 経由の注文は最初からこの状態)
+- `9` — 期限切れ
+- `1` / `2` — 旧フロー (未署名 / 署名済み回収待ち) の名残。新規注文では発生しない
+
+各注文には `refunds[]` フィールドが付き、ショップが過去に行った返金履歴
+(完了したものだけ) が時系列で並ぶ。1 注文に対して複数回の部分返金がある
+ケースを含む。各 refund は `{ amount_jpyc, tx_hash, chain_id, completed_at }`
+の形。pending/failed の内部状態は外部に出さない。実際の受領金額を計算する
+場合は `total_jpyc - sum(refunds[].amount_jpyc)` をすると良い。
+
+**発送状況** — `order_status` (決済) とは独立して、物理商品の発送状況が
+次のフィールドで返る:
+
+- `shipping_status` — `null` (配送不要 or 発送準備前) / `"pending"` (発送準備中) /
+  `"shipped"` (発送済み) / `"delivered"` (配送完了)
+- `shipped_at` — 発送日時 (ISO8601, nullable)
+- `tracking_number` — 追跡番号 (nullable)
+- `shipping_carrier` — 配送業者名 (nullable)
+
+決済完了 (`order_status: 3`) でも `shipping_status` が `null`/`pending` の
+うちはまだ発送されていない。ユーザーに「発送済みか」を答えるときは
+`order_status` ではなく `shipping_status` を見ること。デジタル商品や配送先の
+ない注文では `shipping_status` は常に `null`。
+
+### Digital product download
+
+商品が `is_digital: true` のデジタル商品 (ダウンロード商品) の場合、決済完了
+(`order_status: 3`) 後にダウンロード URL を発行できる。
+
+**本人確認は SIWE (Sign-In with Ethereum) 署名チャレンジ**。ウォレットアドレス
+は公開情報のため、自己申告アドレスでは本人確認にならない。購入ウォレットの
+秘密鍵で署名できることを証明する必要がある (署名のみ・送金は発生しない)。
+
+手順:
+
+1. nonce を取得 (5 分有効・使い捨て):
+
+```http
+POST https://ec.jpyc-service.com/api/auth/siwe/nonce
+Content-Type: application/json
+
+{ "address": "0x<購入ウォレット>" }
+```
+
+レスポンス: `{ "nonce": "<hex>" }`
+
+2. SIWE メッセージ (EIP-4361) を組み立てて `personal_sign` で署名する。
+   `domain` / `uri` は EC のもの、`nonce` は手順 1 の値を使うこと
+   (サーバが domain と nonce を検証する):
+
+```
+domain:    ec.jpyc-service.com
+address:   0x<購入ウォレット>
+statement: Sign to download your purchased file. No token transfer will occur.
+uri:       https://ec.jpyc-service.com
+version:   1
+chainId:   <購入時の chain_id>
+nonce:     <手順 1 の nonce>
+issuedAt:  <現在時刻 ISO8601>
+```
+
+(siwe ライブラリなら `new SiweMessage({...}).prepareMessage()` の出力を署名)
+
+3. ダウンロード URL を発行:
+
+```http
+POST https://ec.jpyc-service.com/api/v1/orders/{order_number}/download
+Content-Type: application/json
+
+{ "message": "<SIWE メッセージ全文>", "signature": "0x<署名>", "product_id": "..." }
+```
+
+レスポンス `data`: `{ url, file_name, version, expires_in_seconds }`。
+署名者アドレスが注文の購入ウォレットと一致し、その注文に該当商品が含まれる
+場合のみ発行される。
+
+ファイルには 2 種類ある:
+
+- **アップロード型**: `url` は短命な署名付き URL。`expires_in_seconds` 秒
+  (既定 300) で失効するため取得後すぐにダウンロードすること。
+- **外部URL型**: `url` はショップが登録した外部 URL。有効期限がないため
+  `expires_in_seconds` は `null`。
+
+常に最新版ファイルが返るため、ショップがファイルを差し替えても同じ手順で
+最新版を取得できる (`version` で確認可能)。エラーは
+`MISSING_SIGNATURE`・`INVALID_MESSAGE` (400) / `UNAUTHORIZED` (401: nonce
+期限切れ・使用済み・署名不正・署名先ドメイン不一致) / `ORDER_NOT_FOUND` (404) / `FORBIDDEN`・`NOT_PURCHASED`
+(403) / `NO_FILE` (404) / `RATE_LIMITED` (429) / `AUTH_UNAVAILABLE` (503: サービス側の認証設定不足)。
+
+LINE連携用のSIWE署名は、`statement` や `resources` に専用の用途・LINEアカウントを含むため、ダウンロードやレシートなど別のAPIには転用できません。目的に合う新しいメッセージへ署名してください。
+
+nonce は並行リクエスト間でも1回しか使用できない。再試行する場合は新しいnonceを取得し、
+対象のECドメインと購入時のチェーンで再署名する。スマートウォレットの署名も、
+SIWEに指定したチェーン上で検証される。`AUTH_UNAVAILABLE` の場合は再署名を繰り返さず、
+サービス側の設定確認が必要な状態として扱う。
+
+### Balance check (optional)
+
+署名前に残高を事前確認したいとき:
+
+```http
+POST https://ec.jpyc-service.com/api/v1/balance/check
+Content-Type: application/json
+
+{
+  "address": "0x<agent wallet>",
+  "required_amount": "1500",
+  "chain_id": 137
+}
+```
+
+レスポンス:
+```json
+{
+  "ok": true,
+  "data": {
+    "address": "0x<agent>",
+    "sufficient": true,
+    "balance": "1234.567",
+    "required": "1500",
+    "chain_id": 137
+  }
+}
+```
+
+実用上は **x402 step 2 の中で facilitator が残高を確認する** ため、事前 check は
+省略可能。step 3 で `insufficient_funds` が返れば残高不足と分かります。
+
+---
+
+## Sample Code (TypeScript / viem)
+
+完全な実装例。`BUYER_PRIVATE_KEY` で署名するエージェント想定。
+
+```typescript
+import { privateKeyToAccount } from "viem/accounts"
+import { keccak256, parseUnits, formatUnits } from "viem"
+import { randomBytes } from "node:crypto"
+
+const BASE = "https://ec.jpyc-service.com"
+const account = privateKeyToAccount(process.env.BUYER_PRIVATE_KEY as `0x${string}`)
+
+async function purchaseCart(shopId: string, productId: string, quantity = 1) {
+  // Step 1: product info
+  const productRes = await fetch(`${BASE}/api/v1/products/${productId}`)
+  const { data: { product } } = await productRes.json()
+
+  // Step 1.5: collect shipping if required (replace with your agent's UX layer)
+  let shipping: any = undefined
+  if (product.requires_shipping) {
+    shipping = await askUserForShipping()  // your UX
+  }
+  let variantSelections: any = undefined
+  if (product.variants) {
+    variantSelections = await askUserForVariant(product.variants)  // your UX
+  }
+
+  // Step 2: 402 challenge (POST /api/v1/checkout — cart-level)
+  const challengeRes = await fetch(`${BASE}/api/v1/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      shop_id: shopId,
+      items: [{ product_id: productId, quantity, variant_selections: variantSelections }],
+      customer_email: "buyer@example.com",  // required
+      shipping,
+    }),
+  })
+  if (challengeRes.status !== 402) {
+    throw new Error(`expected 402, got ${challengeRes.status}: ${await challengeRes.text()}`)
+  }
+  const requiredHeader = challengeRes.headers.get("PAYMENT-REQUIRED")!
+  // Node の Buffer は "base64url" を直接サポート (RFC 4648 §5)。"base64" を
+  // 指定すると `-` `_` の置換が無く JSON が壊れることがあるので必ず "base64url"
+  // を使うこと。
+  const required = JSON.parse(Buffer.from(requiredHeader, "base64url").toString())
+  const accepts = required.accepts.find((a) => a.extra.assetTransferMethod === "eip3009")
+  if (!accepts) throw new Error("No supported eip3009 payment method")
+  const { reservation_id } = (await challengeRes.json()).data
+
+  // Confirm with user before signing (recommended)
+  const totalJpyc = formatUnits(BigInt(accepts.amount), 18)
+  await confirmWithUser(`Pay ${totalJpyc} JPYC to ${accepts.payTo}?`)  // your UX
+
+  // Step 3a: sign EIP-712
+  const validBefore = BigInt(Math.floor(Date.now() / 1000) + accepts.maxTimeoutSeconds)
+  const nonce = ("0x" + randomBytes(32).toString("hex")) as `0x${string}`
+  const signature = await account.signTypedData({
+    domain: {
+      name: accepts.extra.name,
+      version: accepts.extra.version,
+      chainId: Number(accepts.network.split(":")[1]),
+      verifyingContract: accepts.asset,
+    },
+    types: {
+      TransferWithAuthorization: [
+        { name: "from", type: "address" },
+        { name: "to", type: "address" },
+        { name: "value", type: "uint256" },
+        { name: "validAfter", type: "uint256" },
+        { name: "validBefore", type: "uint256" },
+        { name: "nonce", type: "bytes32" },
+      ],
+    },
+    primaryType: "TransferWithAuthorization",
+    message: {
+      from: account.address,
+      to: accepts.payTo,
+      value: BigInt(accepts.amount),
+      validAfter: 0n,
+      validBefore,
+      nonce,
+    },
+  })
+
+  // Step 3b: build PaymentPayload
+  const payload = {
+    x402Version: 2,
+    accepted: accepts,
+    payload: {
+      signature,
+      authorization: {
+        from: account.address,
+        to: accepts.payTo,
+        value: accepts.amount,
+        validAfter: "0",
+        validBefore: validBefore.toString(),
+        nonce,
+      },
+    },
+  }
+  const sigHeader = Buffer.from(JSON.stringify(payload)).toString("base64url")
+
+  // Step 3c: settle
+  const settleRes = await fetch(`${BASE}/api/v1/checkout`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "PAYMENT-SIGNATURE": sigHeader,
+    },
+    body: JSON.stringify({ reservation_id }),
+  })
+  if (settleRes.status !== 200) {
+    const err = await settleRes.json()
+    throw new Error(`settle failed: ${err.error.code} ${err.error.message}`)
+  }
+  const result = await settleRes.json()
+  return result.data  // { order_id, order_number, tx_hash, network, payer, amount_atomic }
+}
+```
+
+---
+
+## Notes
+
+- **Reservation lifetime**: 5 分。`maxTimeoutSeconds` (デフォルト 90 秒) より長く取って
+  あるので、エージェントがユーザー確認しても余裕がある
+- **EIP-3009 nonce**: クライアント側で 32-byte ランダム生成。サーバ側生成は不要
+- **Stock**: 予約時に数量を確認しますが、在庫は取り置きされません。決済確定時のDBトランザクションで在庫を再確認し、条件付きで減算します。クーポン利用枠の予約とは別です。
+- **多商品カート**: `POST /api/v1/checkout` は `items[]` で複数商品をまとめて
+  購入できる。1 商品でも複数でも同じエンドポイント・同じ 1 回の署名で完結する
+- **Discount / NFT 割引**: `/api/v1/checkout` は `discount` ブロックを受け付ける
+  が、`discount: { rule_id }` でルールだけを指定し、保有確認と割引額の算出は
+  サーバーが行います。署名する `payer_address` が必要で、クーポンとの併用はできません
+- **贈り物 / のし等のオプション**: `is_gift` / `gift_recipient` / `checkout_options`
+  を `/api/v1/checkout` の body に渡せる
+- **廃止済みの旧 endpoint**: `POST /api/v1/products/:id/checkout` と
+  `POST /api/v1/orders` 系は廃止済み。購入は `POST /api/v1/checkout`
+  （人間の買い物客と AI エージェント共通の単一エンドポイント）に一本化
+  されている
+- **送料**: `requires_shipping=true` の商品は **送料込みの amount** が `accepted.amount`
+  に入って返る。エージェント側で別途送料計算は不要 (PaymentRequired を信頼すれば OK)
+- **エラーコード `errorReason`**: x402 v2 spec で定義された code をそのまま返す
+  (`insufficient_funds`, `invalid_exact_evm_payload_signature` 等)。詳細は
+  [coinbase/x402 仕様 §9](https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md) 参照
+
+## 2026-09-18 販売期間・数量上限・クーポン
+
+以下は本番とステージングの共通仕様です。ユーザーが選んだ環境の商品レスポンスとOpenAPIを確認し、その環境のAPI・対応チェーンを使ってください。
+
+- 同一商品の複数バリエーションはそれぞれ `items[]` の別行に指定できます。在庫と購入上限は商品単位の数量合計で判定されます。商品の `max_quantity_per_order` がある場合、同一商品のバリエーション違いを含む数量合計を上限以下にしてください。`null` は購入上限なしです。
+- `online_sale_status` (`coming_soon` / `on_sale` / `ended`)、`online_purchase_available`、販売開始・終了日時を確認してください。公開中でも販売期間外には購入できません。予約時にはサーバーが再検証し、409 `sale_not_started` / `sale_ended` / `quantity_limit_exceeded` を返す場合があります。
+- 販売期間の対面レジ例外は、ショップがPOS販売を許可した配送不要・バリエーションなしの商品だけに適用されます。外部購入クライアントは `X-JPYC-CLIENT: pos` や `pos_session_id` を送らず、販売開始を待ってください。
+- クーポンを利用するときは、初回checkoutに `coupon_code`、署名するウォレットの `payer_address`、16〜64文字の `idempotency_key` (UUID推奨) を送ります。通信断後は同じ購入内容・同じキーで再送し、返された予約と金額を使ってください。別の購入にキーを流用しません。
+- NFT割引は `discount: { rule_id }` だけを指定します。割引額や保有状態の自己申告は使われません。NFT割引とクーポンは併用不可です。
+- クーポンの総上限・ウォレット上限は予約時に確保されます。409 `coupon_total_limit_reached` / `coupon_wallet_limit_reached` / `coupon_not_applicable` / `coupon_changed` ではコードと条件を確認してください。別ウォレットでの制限回避を行ってはいけません。
+- `idempotency_conflict` はキーに対応する購入内容が変わっています。送金前かどうかを確認してから購入内容を見直してください。`zero_payment_total` はクーポン適用後が0 JPYC以下です。
+- AA所有確認後は送金APIの呼び出し前から利用枠を保持します。結果不明時には同じ予約で確認を続け、新規予約や送金の再実行はしません。
+- 商品検索 `GET /products/search` は `q` / `shop` / `tag` / `category` / `minPrice` / `maxPrice` / `inStock` / `sort` / `limit` / `offset` を受け取ります。`limit` は1〜50、`offset` は0〜10000です。レスポンスは `{ products, server_time, pagination: { limit, offset, hasMore } }` です。
+
+SIWEの認証nonceは、同じアドレスで再発行すると前のものが置き換わり、使用できるのは一度だけです。認証nonceと、送金に使うEIP-3009のnonceを混同しないでください。
